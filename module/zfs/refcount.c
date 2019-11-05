@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2015, 2019 by Delphix. All rights reserved.
  */
 
 #include <sys/zfs_context.h>
@@ -54,13 +54,30 @@ zfs_refcount_fini(void)
 	kmem_cache_destroy(reference_history_cache);
 }
 
+static int
+zfs_refcount_compare(const void *l, const void *r)
+{
+	const reference_t *lrefn = l;
+	const reference_t *rrefn = r;
+
+	int64_t cmp = TREE_CMP(lrefn->ref_holder, rrefn->ref_holder);
+	if (likely(cmp))
+		return (cmp);
+	cmp = TREE_CMP(lrefn->ref_number, rrefn->ref_number);
+	if (likely(cmp))
+		return (cmp);
+	return (TREE_ISIGN(cmp));
+}
+
 void
 zfs_refcount_create(zfs_refcount_t *rc)
 {
 	mutex_init(&rc->rc_mtx, NULL, MUTEX_DEFAULT, NULL);
-	list_create(&rc->rc_list, sizeof (reference_t),
+	avl_create(&rc->rc_list, zfs_refcount_compare,
+	    sizeof (reference_t),
 	    offsetof(reference_t, ref_link));
-	list_create(&rc->rc_removed, sizeof (reference_t),
+	avl_create(&rc->rc_removed, zfs_refcount_compare,
+	    sizeof (reference_t),
 	    offsetof(reference_t, ref_link));
 	rc->rc_count = 0;
 	rc->rc_removed_count = 0;
@@ -87,18 +104,19 @@ zfs_refcount_destroy_many(zfs_refcount_t *rc, uint64_t number)
 	reference_t *ref;
 
 	ASSERT3U(rc->rc_count, ==, number);
-	while ((ref = list_head(&rc->rc_list))) {
-		list_remove(&rc->rc_list, ref);
+	// XXX - better way to walk ?
+	while ((ref = avl_first(&rc->rc_list))) {
+		avl_remove(&rc->rc_list, ref);
 		kmem_cache_free(reference_cache, ref);
 	}
-	list_destroy(&rc->rc_list);
+	avl_destroy(&rc->rc_list);
 
-	while ((ref = list_head(&rc->rc_removed))) {
-		list_remove(&rc->rc_removed, ref);
+	while ((ref = avl_first(&rc->rc_removed))) {
+		avl_remove(&rc->rc_removed, ref);
 		kmem_cache_free(reference_history_cache, ref->ref_removed);
 		kmem_cache_free(reference_cache, ref);
 	}
-	list_destroy(&rc->rc_removed);
+	avl_destroy(&rc->rc_removed);
 	mutex_destroy(&rc->rc_mtx);
 }
 
@@ -134,7 +152,7 @@ zfs_refcount_add_many(zfs_refcount_t *rc, uint64_t number, const void *holder)
 	mutex_enter(&rc->rc_mtx);
 	ASSERT3U(rc->rc_count, >=, 0);
 	if (rc->rc_tracked)
-		list_insert_head(&rc->rc_list, ref);
+		avl_add(&rc->rc_list, ref);
 	rc->rc_count += number;
 	count = rc->rc_count;
 	mutex_exit(&rc->rc_mtx);
@@ -152,7 +170,9 @@ int64_t
 zfs_refcount_remove_many(zfs_refcount_t *rc, uint64_t number,
     const void *holder)
 {
-	reference_t *ref;
+	reference_t ref_search;
+	reference_t *ref = NULL;
+	avl_index_t where;
 	int64_t count;
 
 	mutex_enter(&rc->rc_mtx);
@@ -165,32 +185,32 @@ zfs_refcount_remove_many(zfs_refcount_t *rc, uint64_t number,
 		return (count);
 	}
 
-	for (ref = list_head(&rc->rc_list); ref;
-	    ref = list_next(&rc->rc_list, ref)) {
-		if (ref->ref_holder == holder && ref->ref_number == number) {
-			list_remove(&rc->rc_list, ref);
-			if (reference_history > 0) {
-				ref->ref_removed =
-				    kmem_cache_alloc(reference_history_cache,
-				    KM_SLEEP);
-				list_insert_head(&rc->rc_removed, ref);
-				rc->rc_removed_count++;
-				if (rc->rc_removed_count > reference_history) {
-					ref = list_tail(&rc->rc_removed);
-					list_remove(&rc->rc_removed, ref);
-					kmem_cache_free(reference_history_cache,
-					    ref->ref_removed);
-					kmem_cache_free(reference_cache, ref);
-					rc->rc_removed_count--;
-				}
-			} else {
+	ref_search.ref_number = number;
+	ref_search.ref_holder = holder;
+	ref = avl_find(&rc->rc_list, &ref_search, &where);
+	if (ref != NULL) { // XXX: might also need to use avl_nearest ?
+		avl_remove(&rc->rc_list, ref);
+		if (reference_history > 0) {
+			ref->ref_removed =
+			    kmem_cache_alloc(reference_history_cache,
+			    KM_SLEEP);
+			avl_insert(&rc->rc_removed, ref, where);
+			rc->rc_removed_count++;
+			if (rc->rc_removed_count > reference_history) {
+				ref = avl_last(&rc->rc_removed);
+				avl_remove(&rc->rc_removed, ref);
+				kmem_cache_free(reference_history_cache,
+				    ref->ref_removed);
 				kmem_cache_free(reference_cache, ref);
+				rc->rc_removed_count--;
 			}
-			rc->rc_count -= number;
-			count = rc->rc_count;
-			mutex_exit(&rc->rc_mtx);
-			return (count);
+		} else {
+			kmem_cache_free(reference_cache, ref);
 		}
+		rc->rc_count -= number;
+		count = rc->rc_count;
+		mutex_exit(&rc->rc_mtx);
+		return (count);
 	}
 	panic("No such hold %p on refcount %llx", holder,
 	    (u_longlong_t)(uintptr_t)rc);
@@ -207,39 +227,60 @@ void
 zfs_refcount_transfer(zfs_refcount_t *dst, zfs_refcount_t *src)
 {
 	int64_t count, removed_count;
-	list_t list, removed;
+	avl_tree_t list, removed;
+	reference_t *ref, *ref_next;
 
-	list_create(&list, sizeof (reference_t),
-	    offsetof(reference_t, ref_link));
-	list_create(&removed, sizeof (reference_t),
-	    offsetof(reference_t, ref_link));
+	avl_create(&list, zfs_refcount_compare,
+	    sizeof (reference_t), offsetof(reference_t, ref_link));
+	avl_create(&removed, zfs_refcount_compare,
+	    sizeof (reference_t), offsetof(reference_t, ref_link));
 
 	mutex_enter(&src->rc_mtx);
 	count = src->rc_count;
 	removed_count = src->rc_removed_count;
 	src->rc_count = 0;
 	src->rc_removed_count = 0;
-	list_move_tail(&list, &src->rc_list);
-	list_move_tail(&removed, &src->rc_removed);
+	// XXX: list_move_tail(&list, &src->rc_list); theres better way to do this
+	for (ref = avl_first(&src->rc_list); ref != NULL; ref = ref_next) {
+		ref_next = AVL_NEXT(&src->rc_list, ref);
+		avl_add(&list, ref);
+	}
+
+	// XXX: list_move_tail(&removed, &src->rc_removed);
+	for (ref = avl_first(&src->rc_removed); ref != NULL; ref = ref_next) {
+		ref_next = AVL_NEXT(&src->rc_removed, ref);
+		avl_add(&removed, ref);
+	}
+
 	mutex_exit(&src->rc_mtx);
 
 	mutex_enter(&dst->rc_mtx);
 	dst->rc_count += count;
 	dst->rc_removed_count += removed_count;
-	list_move_tail(&dst->rc_list, &list);
-	list_move_tail(&dst->rc_removed, &removed);
+	// XXX: list_move_tail(&dst->rc_list, &list);
+	for (ref = avl_first(&list); ref != NULL; ref = ref_next) {
+		ref_next = AVL_NEXT(&list, ref);
+		avl_add(&dst->rc_list, ref);
+	}
+	// XXX: list_move_tail(&dst->rc_removed, &removed);
+	for (ref = avl_first(&removed); ref != NULL; ref = ref_next) {
+		ref_next = AVL_NEXT(&removed, ref);
+		avl_add(&dst->rc_removed, ref);
+	}
 	mutex_exit(&dst->rc_mtx);
 
-	list_destroy(&list);
-	list_destroy(&removed);
+	avl_destroy(&list);
+	avl_destroy(&removed);
 }
 
 void
 zfs_refcount_transfer_ownership_many(zfs_refcount_t *rc, uint64_t number,
     const void *current_holder, const void *new_holder)
 {
-	reference_t *ref;
 	boolean_t found = B_FALSE;
+	reference_t *ref = NULL;
+	reference_t ref_search;
+	avl_index_t where;
 
 	mutex_enter(&rc->rc_mtx);
 	if (!rc->rc_tracked) {
@@ -247,14 +288,12 @@ zfs_refcount_transfer_ownership_many(zfs_refcount_t *rc, uint64_t number,
 		return;
 	}
 
-	for (ref = list_head(&rc->rc_list); ref;
-	    ref = list_next(&rc->rc_list, ref)) {
-		if (ref->ref_holder == current_holder &&
-		    ref->ref_number == number) {
-			ref->ref_holder = new_holder;
-			found = B_TRUE;
-			break;
-		}
+	ref_search.ref_number = number;
+	ref_search.ref_holder = current_holder;
+	ref = avl_find(&rc->rc_list, &ref_search, &where);
+	if (ref != NULL) { // XXX: might also need to use avl_nearest ?
+		ref->ref_holder = new_holder;
+		found = B_TRUE;
 	}
 	ASSERT(found);
 	mutex_exit(&rc->rc_mtx);
@@ -276,7 +315,9 @@ zfs_refcount_transfer_ownership(zfs_refcount_t *rc, const void *current_holder,
 boolean_t
 zfs_refcount_held(zfs_refcount_t *rc, const void *holder)
 {
-	reference_t *ref;
+	reference_t *ref = NULL;
+	reference_t ref_search;
+	avl_index_t where;
 
 	mutex_enter(&rc->rc_mtx);
 
@@ -285,12 +326,12 @@ zfs_refcount_held(zfs_refcount_t *rc, const void *holder)
 		return (rc->rc_count > 0);
 	}
 
-	for (ref = list_head(&rc->rc_list); ref;
-	    ref = list_next(&rc->rc_list, ref)) {
-		if (ref->ref_holder == holder) {
-			mutex_exit(&rc->rc_mtx);
-			return (B_TRUE);
-		}
+	ref_search.ref_number = rc->rc_count; // XXX - will rc_count be valid ?
+	ref_search.ref_holder = holder;
+	ref = avl_find(&rc->rc_list, &ref_search, &where);
+	if (ref != NULL) { // XXX: might also need to use avl_nearest ?
+		mutex_exit(&rc->rc_mtx);
+		return (B_TRUE);
 	}
 	mutex_exit(&rc->rc_mtx);
 	return (B_FALSE);
@@ -304,7 +345,9 @@ zfs_refcount_held(zfs_refcount_t *rc, const void *holder)
 boolean_t
 zfs_refcount_not_held(zfs_refcount_t *rc, const void *holder)
 {
-	reference_t *ref;
+	reference_t *ref = NULL;
+	reference_t ref_search;
+	avl_index_t where;
 
 	mutex_enter(&rc->rc_mtx);
 
@@ -313,12 +356,12 @@ zfs_refcount_not_held(zfs_refcount_t *rc, const void *holder)
 		return (B_TRUE);
 	}
 
-	for (ref = list_head(&rc->rc_list); ref;
-	    ref = list_next(&rc->rc_list, ref)) {
-		if (ref->ref_holder == holder) {
-			mutex_exit(&rc->rc_mtx);
-			return (B_FALSE);
-		}
+	ref_search.ref_number = rc->rc_count; // XXX - will rc_count be valid ?
+	ref_search.ref_holder = holder;
+	ref = avl_find(&rc->rc_list, &ref_search, &where);
+	if (ref != NULL) { // XXX: might also need to use avl_nearest ?
+		mutex_exit(&rc->rc_mtx);
+		return (B_FALSE);
 	}
 	mutex_exit(&rc->rc_mtx);
 	return (B_TRUE);

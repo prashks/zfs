@@ -27,7 +27,7 @@
 #define	_SYS_REFCOUNT_H
 
 #include <sys/inttypes.h>
-#include <sys/list.h>
+#include <sys/avl.h>
 #include <sys/zfs_context.h>
 
 #ifdef	__cplusplus
@@ -43,7 +43,7 @@ extern "C" {
 
 #ifdef	ZFS_DEBUG
 typedef struct reference {
-	list_node_t ref_link;
+	avl_node_t ref_link;
 	const void *ref_holder;
 	uint64_t ref_number;
 	uint8_t *ref_removed;
@@ -52,8 +52,8 @@ typedef struct reference {
 typedef struct refcount {
 	kmutex_t rc_mtx;
 	boolean_t rc_tracked;
-	list_t rc_list;
-	list_t rc_removed;
+	avl_tree_t rc_list;
+	avl_tree_t rc_removed;
 	uint64_t rc_count;
 	uint64_t rc_removed_count;
 } zfs_refcount_t;
